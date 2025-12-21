@@ -532,24 +532,18 @@ class Trainer:
             print(" mean:", self.global_mean.shape)
             print(" cov:", self.global_cov.shape)
 
-    def global_anomaly_score(self, img_tensor, model_name='spatial_transformer', norm_method='none'):
-        feats = self.global_features(img_tensor, model_name)  # shape: 1 × D
-        feats = feats.squeeze(0).cpu()
+    def global_anomaly_score(self, img_tensor, model_name='spatial_transformer'):
+        """
+        img_tensor: (1, 3, H, W)
+        """
+        feats = self.global_features(img_tensor, model_name)  # 1 × D
+        feats = feats.squeeze(0)
 
-        # 2) Compute raw Mahalanobis distance score
-        delta = feats - self.global_mean
-        raw_score = torch.sqrt(delta @ self.global_cov_inv @ delta.T).item()
+        delta = feats - self.global_mean.to(feats.device)
+        score = torch.sqrt(delta @ self.global_cov_inv.to(feats.device) @ delta.T)
 
-        # 3) Normalization
-        if norm_method == 'none':
-            return raw_score
+        return score.item()
 
-        elif norm_method == 'minmax':             # Avoid division by zero
-            denom = (self.max_score - self.min_score) if (self.max_score - self.min_score) != 0 else 1e-9
-            norm_score = (raw_score - self.min_score) / denom
-            return float(norm_score)
-        else:
-            return raw_score
 
     def plot_score_distribution(self, scores: np.ndarray, filename: str):
         plt.figure(figsize=(12, 6))
@@ -628,43 +622,7 @@ class Trainer:
         self.global_models[model_name] = model
         return model
    
-    def compute_global_anomaly_score(self, imgs: torch.Tensor, recon: torch.Tensor, global_model: nn.Module, model_name: str = 'spatial_transformer'):
-        batch_size = imgs.size(0)
-        
-        with torch.no_grad():
-            if model_name == 'spatial_transformer':
-                gf_real, attn_real = global_model(imgs)
-                gf_fake, attn_fake = global_model(recon)
-                
-                attn_diff = F.mse_loss(attn_fake, attn_real, reduction='none')
-                attn_score = attn_diff.view(batch_size, -1).mean(dim=1)
-                
-                cos_sim = F.cosine_similarity(gf_real, gf_fake, dim=1)
-                feature_score = 1.0 - cos_sim
-                
-                return feature_score + 0.1 * attn_score
-            else:
-                imgs_01 = (imgs + 1.0) / 2.0
-                recon_01 = (recon + 1.0) / 2.0
-                
-                mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-                std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-                
-                imgs_norm = (imgs_01 - mean) / std
-                recon_norm = (recon_01 - mean) / std
-                
-                gf_real = global_model(imgs_norm)
-                gf_fake = global_model(recon_norm)
-            
-            if len(gf_real.shape) > 2:
-                gf_real = gf_real.view(batch_size, -1)
-                gf_fake = gf_fake.view(batch_size, -1)
-            
-            cos_sim = F.cosine_similarity(gf_real, gf_fake, dim=1)
-            global_loss = 1.0 - cos_sim
-            
-            return global_loss
-
+    
     def anomaly_score(self, imgs: torch.Tensor, use_global: bool = False, global_model_name: str = 'spatial_transformer', normalize: bool = True, method: str = 'percentile', **kwargs):
         self.G.eval()
         self.E.eval()
@@ -694,12 +652,31 @@ class Trainer:
             raw_score = A_R + self.cfg.kappa * A_D
             
             if use_global and global_model_name and global_model_name != 'none':
-                global_model = self.build_global_model(global_model_name)
-                global_loss = self.compute_global_anomaly_score(imgs, recon, global_model, global_model_name)
-                
+                imgs_01 = (imgs + 1.0) / 2.0
+                recon_01 = (recon + 1.0) / 2.0
+                global_scores = []
+
+                for i in range(imgs_01.size(0)):
+                    # 1. Добиј features за оригинал и реконструкцију
+                    feat_original = self.global_features(imgs_01[i:i+1], global_model_name)
+                    feat_recon = self.global_features(recon_01[i:i+1], global_model_name)
+                    
+                    # 2. Поређи их (cosine similarity или MSE)
+                    cos_sim = F.cosine_similarity(feat_original, feat_recon, dim=1)
+                    similarity_score = 1.0 - cos_sim  # 0 = идентични, 1 = различити
+                    
+                    # 3. Можеш додати и Mahalanobis за оригинал ако желиш
+                    mahal_original = self.global_anomaly_score(imgs_01[i:i+1], global_model_name)
+                    
+                    # 4. Комбинуј (више тежине за similarity јер је битније за логичке аномалије)
+                    combined_score = 0.7 * similarity_score + 0.3 * mahal_original
+                    
+                    global_scores.append(combined_score.item())
+
+                global_scores = torch.tensor(global_scores, device=self.device)
                 weight = self.global_model_weights.get(global_model_name, 0.5)
-                raw_score = raw_score + weight * global_loss
-            
+                raw_score = raw_score + weight * global_scores
+                    
             raw_score_np = raw_score.cpu().numpy()
             
             if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:                    
@@ -776,7 +753,7 @@ def evaluate_single_model(trainer: Trainer, data_root: str, category: str, devic
 
                 # 2) GLOBAL SCORE (FULL-IMAGE)
                 if global_model_name != "none":
-                        global_score = trainer.global_anomaly_score(img_tensor, global_model_name,'minmax')
+                    global_score = trainer.global_anomaly_score(img_tensor, global_model_name)
                 else:
                     global_score = 0.0
                 
