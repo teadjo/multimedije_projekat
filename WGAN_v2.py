@@ -516,21 +516,21 @@ class Trainer:
 
     def compute_global_feature_stats(self, dataloader, model_name='spatial_transformer'):
         feats_all = []
+        if(model_name != 'none'):
+            for imgs, _ in tqdm(dataloader, desc="Building global feature distribution"):
+                imgs = imgs.to(self.device)
 
-        for imgs, _ in tqdm(dataloader, desc="Building global feature distribution"):
-            imgs = imgs.to(self.device)
+                feats = self.global_features(imgs, model_name)
+                feats_all.append(feats.cpu())
 
-            feats = self.global_features(imgs, model_name)
-            feats_all.append(feats.cpu())
+            feats_all = torch.cat(feats_all, dim=0)   # shape: N × D
+            self.global_mean = feats_all.mean(dim=0)
+            self.global_cov = torch.cov(feats_all.T) + 1e-5 * torch.eye(feats_all.shape[1])
 
-        feats_all = torch.cat(feats_all, dim=0)   # shape: N × D
-        self.global_mean = feats_all.mean(dim=0)
-        self.global_cov = torch.cov(feats_all.T) + 1e-5 * torch.eye(feats_all.shape[1])
+            self.global_cov_inv = torch.inverse(self.global_cov)         # inverse covariance
 
-        self.global_cov_inv = torch.inverse(self.global_cov)         # inverse covariance
-
-        print(" mean:", self.global_mean.shape)
-        print(" cov:", self.global_cov.shape)
+            print(" mean:", self.global_mean.shape)
+            print(" cov:", self.global_cov.shape)
 
     def global_anomaly_score(self, img_tensor, model_name='spatial_transformer', norm_method='none'):
         feats = self.global_features(img_tensor, model_name)  # shape: 1 × D
@@ -548,12 +548,6 @@ class Trainer:
             denom = (self.max_score - self.min_score) if (self.max_score - self.min_score) != 0 else 1e-9
             norm_score = (raw_score - self.min_score) / denom
             return float(norm_score)
-
-        elif norm_method == 'softmax':  # Softmax over one value = always 1.0, so instead use temperature scaling
-            temp = 10.0
-            norm_score = np.exp(raw_score / temp)
-            return float(norm_score)
-
         else:
             return raw_score
 
@@ -708,13 +702,8 @@ class Trainer:
             
             raw_score_np = raw_score.cpu().numpy()
             
-            if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:
-                if method == 'percentile':
-                    z_scores = (raw_score_np - self.mu_score) / (self.sigma_score + 1e-8)
-                    percentile = norm.cdf(z_scores)
-                    normalized = 1.0 - percentile
-                    
-                elif method == 'zscore':
+            if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:                    
+                if method == 'zscore':
                     z_scores = (raw_score_np - self.mu_score) / (self.sigma_score + 1e-8)
                     normalized = np.log1p(np.exp(z_scores))
                     

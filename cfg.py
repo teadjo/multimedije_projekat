@@ -19,7 +19,7 @@ class CFG:
     n_critic = 5             
     epochs_gan = 450
     epochs_enc = 150          
-    kappa = 0.2            
+    kappa = 0.9            
 
     out_dir = "outputs"
     ckpt_dir = "checkpoints"
