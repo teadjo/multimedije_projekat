@@ -75,7 +75,8 @@ python WGAN_v2.py \
   --category breakfast_box \
   --phase eval \
   --ckpt checkpoints/gan_latest.pth \
-  --enc_ckpt checkpoints/encoder_latest.pth
+  --enc_ckpt checkpoints/encoder_latest.pth \
+   --global_model none
 
 
 Sa globalnim modelom:
