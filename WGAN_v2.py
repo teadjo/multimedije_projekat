@@ -533,9 +533,6 @@ class Trainer:
             print(" cov:", self.global_cov.shape)
 
     def global_anomaly_score(self, img_tensor, model_name='spatial_transformer'):
-        """
-        img_tensor: (1, 3, H, W)
-        """
         feats = self.global_features(img_tensor, model_name)  # 1 × D
         feats = feats.squeeze(0)
 
@@ -622,7 +619,18 @@ class Trainer:
         self.global_models[model_name] = model
         return model
    
-    
+    def normalized_mahalanobis(self, img_tensor, model_name='spatial_transformer'):
+        raw_mahal = self.global_anomaly_score(img_tensor, model_name)
+        
+        if hasattr(self, 'min_score') and hasattr(self, 'max_score'):
+            denom = max(1e-9, self.max_score - self.min_score)
+            norm_mahal = (raw_mahal - self.min_score) / denom
+            norm_mahal = max(0.0, min(1.0, norm_mahal)) 
+        else:
+            norm_mahal = 1.0 / (1.0 + np.exp(-0.1 * raw_mahal)) 
+        
+        return norm_mahal
+
     def anomaly_score(self, imgs: torch.Tensor, use_global: bool = False, global_model_name: str = 'spatial_transformer', normalize: bool = True, method: str = 'percentile', **kwargs):
         self.G.eval()
         self.E.eval()
@@ -657,19 +665,14 @@ class Trainer:
                 global_scores = []
 
                 for i in range(imgs_01.size(0)):
-                    # 1. Добиј features за оригинал и реконструкцију
                     feat_original = self.global_features(imgs_01[i:i+1], global_model_name)
                     feat_recon = self.global_features(recon_01[i:i+1], global_model_name)
                     
-                    # 2. Поређи их (cosine similarity или MSE)
                     cos_sim = F.cosine_similarity(feat_original, feat_recon, dim=1)
-                    similarity_score = 1.0 - cos_sim  # 0 = идентични, 1 = различити
+                    similarity_diff = (1.0 - cos_sim) / 2.0 
+                    mahal_norm = self.normalized_mahalanobis(imgs_01[i:i+1], global_model_name)
                     
-                    # 3. Можеш додати и Mahalanobis за оригинал ако желиш
-                    mahal_original = self.global_anomaly_score(imgs_01[i:i+1], global_model_name)
-                    
-                    # 4. Комбинуј (више тежине за similarity јер је битније за логичке аномалије)
-                    combined_score = 0.7 * similarity_score + 0.3 * mahal_original
+                    combined_score = 0.7 * similarity_diff + 0.3 * mahal_norm
                     
                     global_scores.append(combined_score.item())
 
