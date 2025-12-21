@@ -39,7 +39,8 @@ Poziv iz terminala:
 python WGAN_v2.py \
   --data_root /putanja/do/MVTec_LOCO \
   --category breakfast_box \
-  --phase train_gan
+  --phase train_gan \
+  --epochs 450 --batch 32
 
 Rezultat:
 
@@ -53,7 +54,8 @@ python WGAN_v2.py \
   --data_root /putanja/do/MVTec_LOCO \
   --category breakfast_box \
   --phase train_encoder \
-  --ckpt checkpoints/gan_latest.pth
+  --ckpt checkpoints/gan_latest.pth \
+  --epochs 100 --batch 32
 
 Rezultat:
 sačuvan enkoder (checkpoints/encoder_latest.pth)
