@@ -18,6 +18,7 @@ from scipy.stats import gaussian_kde, norm
 import warnings
 from plots import plot_evaluation_curves, plot_score_distributions, plot_patch_heatmap
 from cfg import cfg, CFG
+import clip
 warnings.filterwarnings('ignore')
 
 os.makedirs(cfg.out_dir, exist_ok=True)
@@ -30,6 +31,39 @@ def seed_everything(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 seed_everything(42)
+
+class FullImageDataset(Dataset): 
+    def __init__(self, root: str, category: str, mode: str='train', image_resize:int=512, transform=None): 
+        self.root = Path(root) 
+        self.category = category 
+        self.mode = mode 
+        self.image_resize = image_resize 
+        self.transform = transform 
+        if mode == 'train': 
+            folder = self.root / category / "train" / "good" 
+        else: 
+            folder = self.root / category / "validation" / "good" 
+        if not folder.exists(): 
+            raise FileNotFoundError(f"{folder} not found") 
+        exts = ('*.png','*.jpg','*.jpeg') 
+        files = [] 
+        for e in exts: 
+            files.extend(sorted(glob.glob(str(folder / e)))) 
+        if len(files) == 0: 
+            raise FileNotFoundError(f"No images in {folder}") 
+        self.files = files 
+        if transform is None: 
+            self.transform = transforms.Compose([ 
+                transforms.ToTensor(), 
+                transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5)) 
+            ]) 
+    def __len__(self): 
+        return len(self.files) 
+    def __getitem__(self, idx): 
+        p = self.files[idx] 
+        img = Image.open(p).convert("RGB").resize((self.image_resize, self.image_resize)) 
+        tensor = self.transform(img) 
+        return tensor, 0
 
 class MVTecLOCO_PatchDataset(Dataset):
     def __init__(self, root: str, category: str, mode: str='train', patch_size:int=128, stride:int=64,
@@ -282,16 +316,81 @@ class Trainer:
         self.opt_D = torch.optim.Adam(self.D.parameters(), lr=cfg.lr, betas=cfg.betas)
         self.opt_E = torch.optim.Adam(self.E.parameters(), lr=cfg.lr, betas=cfg.betas)
 
+        self.global_model_weights = {
+            'clip': 0.6,  # Povećano za bolju detekciju logičkih anomalija
+        }
         self.mu_score = 0.0
         self.sigma_score = 1.0
         self.min_score = 0.0
         self.max_score = 1.0
         self.q95 = 0.0
         
+        # UNIFIKOVANE NORMALIZACIJE
+        self.unified_mu = 0.0
+        self.unified_sigma = 1.0
+        self.unified_min = 0.0
+        self.unified_max = 1.0
+        
         self.global_models = {}
-        self.global_model_weights = {
-            'spatial_transformer': 0.5,
-        }
+
+    def compute_unified_normalization(self, train_dataloader):
+        """Računa normalizacione parametre za KOMBINOVANI skor"""
+        all_combined_scores = []
+        
+        print("Computing unified normalization statistics...")
+        
+        for imgs, _ in tqdm(train_dataloader, desc="Processing training images"):
+            imgs = imgs.to(self.device)
+            
+            # 1. Računaj PATCH skor (raw)
+            patch_normalized, patch_raw, _ = self.anomaly_score(
+                imgs, use_global=False, normalize=False, method='raw'
+            )
+            
+            # 2. Računaj GLOBAL skor
+            global_scores = []
+            for i in range(imgs.size(0)):
+                clip_score = self.global_anomaly_score(imgs[i:i+1], 'clip')
+                global_scores.append(clip_score)
+            global_scores = np.array(global_scores)
+            
+            # 3. Kombinovani skor (pre normalizacije)
+            alpha = self.global_model_weights.get('clip', 0.5)
+            combined_raw = (1 - alpha) * patch_raw + alpha * global_scores
+            
+            all_combined_scores.extend(combined_raw)
+        
+        # Sačuvaj statistike za KOMBINOVANI skor
+        self.unified_mu = np.mean(all_combined_scores)
+        self.unified_sigma = np.std(all_combined_scores)
+        self.unified_min = np.min(all_combined_scores)
+        self.unified_max = np.max(all_combined_scores)
+        self.unified_q95 = np.percentile(all_combined_scores, 95)
+        
+        print(f"Unified normalization stats:")
+        print(f"  Mean: {self.unified_mu:.4f}, Std: {self.unified_sigma:.4f}")
+        print(f"  Range: [{self.unified_min:.4f}, {self.unified_max:.4f}]")
+        print(f"  95th percentile: {self.unified_q95:.4f}")
+
+    def normalized_combined_score(self, patch_raw, global_raw, method='zscore'):
+        """Normalizuj KOMBINOVANI skor na isti način"""
+        alpha = self.global_model_weights.get('clip', 0.5)
+        combined_raw = (1 - alpha) * patch_raw + alpha * global_raw
+        
+        if method == 'zscore':
+            # Z-score normalizacija
+            normalized = (combined_raw - self.unified_mu) / (self.unified_sigma + 1e-8)
+            # Mapiraj na [0, 1] sigmoidom
+            normalized = 1 / (1 + np.exp(-normalized))
+            
+        elif method == 'minmax':
+            # Min-Max normalizacija na [0, 1]
+            normalized = (combined_raw - self.unified_min) / (self.unified_max - self.unified_min + 1e-8)
+            normalized = np.clip(normalized, 0, 1)
+        elif method == 'raw':
+            normalized = combined_raw
+            
+        return normalized
 
     def train_gan(self, dataloader: DataLoader, epochs: int = 50, save_every: int = 5):
         cfg = self.cfg
@@ -380,7 +479,7 @@ class Trainer:
                 fm_loss = 0.0
                 for fr, ff in zip(feats_real, feats_fake):
                     fr_flat = fr.view(fr.size(0), -1)
-                    ff_flat = ff.view(ff.size(0), -1)
+                    ff_flat = ff.view(fr.size(0), -1)
                     fm_loss = fm_loss + F.mse_loss(ff_flat, fr_flat.detach())
 
                 loss = loss_rec + self.cfg.kappa * fm_loss
@@ -507,40 +606,57 @@ class Trainer:
         global_model.eval()
 
         with torch.no_grad():
-            feats = global_model((imgs + 1) / 2) 
-
-        if isinstance(feats, tuple):          # If model returns tuple (e.g., Spatial Transformer)
-            feats = feats[0]   # take the main embedding
+            if model_name == 'clip':
+                imgs_01 = (imgs + 1.0) / 2.0 
+                feats = global_model(imgs_01)
+            else:
+                feats = global_model((imgs + 1) / 2)
 
         return feats
 
-    def compute_global_feature_stats(self, dataloader, model_name='spatial_transformer'):
+    def compute_global_feature_stats(self, dataloader, model_name='clip'):
+        if model_name == 'none':
+            return
+            
         feats_all = []
-        if(model_name != 'none'):
-            for imgs, _ in tqdm(dataloader, desc="Building global feature distribution"):
-                imgs = imgs.to(self.device)
+        for imgs, _ in tqdm(dataloader, desc="Building global feature distribution"):
+            imgs = imgs.to(self.device)
+            feats = self.global_features(imgs, model_name)
+            feats_all.append(feats.cpu())
 
-                feats = self.global_features(imgs, model_name)
-                feats_all.append(feats.cpu())
-
-            feats_all = torch.cat(feats_all, dim=0)   # shape: N × D
+        if feats_all:
+            feats_all = torch.cat(feats_all, dim=0)
             self.global_mean = feats_all.mean(dim=0)
-            self.global_cov = torch.cov(feats_all.T) + 1e-5 * torch.eye(feats_all.shape[1])
+            self.global_std = feats_all.std(dim=0)
+            
+            print(f"Global features ({model_name}): {feats_all.shape}")
+            print(f"Mean shape: {self.global_mean.shape}")
 
-            self.global_cov_inv = torch.inverse(self.global_cov)         # inverse covariance
-
-            print(" mean:", self.global_mean.shape)
-            print(" cov:", self.global_cov.shape)
-
-    def global_anomaly_score(self, img_tensor, model_name='spatial_transformer'):
-        feats = self.global_features(img_tensor, model_name)  # 1 × D
-        feats = feats.squeeze(0)
-
-        delta = feats - self.global_mean.to(feats.device)
-        score = torch.sqrt(delta @ self.global_cov_inv.to(feats.device) @ delta.T)
-
-        return score.item()
-
+    def global_anomaly_score(self, img_tensor, model_name='clip'):
+        if model_name == 'none':
+            return 0.0
+        
+        if model_name == 'clip':
+            # Za CLIP koristimo kombinaciju distance
+            feats = self.global_features(img_tensor, model_name)  # (1, feature_dim)
+            feats = feats.squeeze(0)
+            
+            # 1. Cosine distance od prosjeka
+            cosine_dist = 1.0 - F.cosine_similarity(
+                feats.unsqueeze(0), 
+                self.global_mean.unsqueeze(0).to(feats.device)
+            ).mean()
+            
+            # 2. Euclidean distance (normalizovana)
+            if hasattr(self, 'global_mean'):
+                euclidean_dist = torch.norm(feats - self.global_mean.to(feats.device))
+                # Normalizuj po training std
+                if hasattr(self, 'global_std'):
+                    euclidean_dist = euclidean_dist / (torch.mean(self.global_std) + 1e-8)
+            
+            # Kombinovani score
+            combined_score = 0.7 * cosine_dist + 0.3 * euclidean_dist.item()
+            return combined_score
 
     def plot_score_distribution(self, scores: np.ndarray, filename: str):
         plt.figure(figsize=(12, 6))
@@ -564,52 +680,33 @@ class Trainer:
         plt.savefig(save_path, dpi=300)
         plt.close()
         
-    def build_global_model(self, model_name: str = 'spatial_transformer'):
+    def build_global_model(self, model_name: str = 'clip'):
         if model_name in self.global_models:
             return self.global_models[model_name]
-                
-        if model_name == 'spatial_transformer':
-            class SpatialRelationModel(nn.Module):
-                def __init__(self, feature_dim=512):
-                    super().__init__()
-                    self.cnn = nn.Sequential(
-                        nn.Conv2d(3, 64, 3, padding=1),
-                        nn.BatchNorm2d(64),
-                        nn.ReLU(),
-                        nn.MaxPool2d(2),
-                        
-                        nn.Conv2d(64, 128, 3, padding=1),
-                        nn.BatchNorm2d(128),
-                        nn.ReLU(),
-                        nn.MaxPool2d(2),
-                        
-                        nn.Conv2d(128, 256, 3, padding=1),
-                        nn.BatchNorm2d(256),
-                        nn.ReLU(),
-                        nn.MaxPool2d(2),
-                    )
-                    
-                    self.spatial_attention = nn.Sequential(
-                        nn.Conv2d(256, 128, 1),
-                        nn.BatchNorm2d(128),
-                        nn.ReLU(),
-                        nn.Conv2d(128, 64, 1),
-                        nn.BatchNorm2d(64),
-                        nn.ReLU(),
-                        nn.Conv2d(64, 1, 1),
-                        nn.Sigmoid()
-                    )
-                    self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-                    
-                def forward(self, x):
-                    features = self.cnn(x)
-                    attention_map = self.spatial_attention(features)
-                    weighted_features = features * attention_map
-                    global_features = self.global_pool(weighted_features)
-                    global_features = global_features.view(global_features.size(0), -1)
-                    return global_features, attention_map
+        
+        if model_name == 'clip':
+            clip_model, clip_preprocess = clip.load("ViT-B/32", device=self.device)
             
-            model = SpatialRelationModel().to(self.device)
+            # Za detekciju anomalija koristimo samo image encoder
+            class CLIPWrapper(nn.Module):
+                def __init__(self, clip_model):
+                    super().__init__()
+                    self.clip = clip_model
+                    # Freeze sve težine
+                    for param in self.clip.parameters():
+                        param.requires_grad = False
+                
+                def forward(self, x):
+                    # x je već u rasponu [0, 1]
+                    # CLIP očekuje specifican preprocessing
+                    x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+                    # CLIP normalizacija
+                    x = (x - torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1,3,1,1).to(x.device)) / \
+                        torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1,3,1,1).to(x.device)
+                    features = self.clip.encode_image(x)
+                    return features.float()  # Konvertuj u float32
+            
+            model = CLIPWrapper(clip_model).to(self.device)
         
         model = model.to(self.device)
         for param in model.parameters():
@@ -618,25 +715,16 @@ class Trainer:
         model.eval()
         self.global_models[model_name] = model
         return model
-   
-    def normalized_mahalanobis(self, img_tensor, model_name='spatial_transformer'):
-        raw_mahal = self.global_anomaly_score(img_tensor, model_name)
-        
-        if hasattr(self, 'min_score') and hasattr(self, 'max_score'):
-            denom = max(1e-9, self.max_score - self.min_score)
-            norm_mahal = (raw_mahal - self.min_score) / denom
-            norm_mahal = max(0.0, min(1.0, norm_mahal)) 
-        else:
-            norm_mahal = 1.0 / (1.0 + np.exp(-0.1 * raw_mahal)) 
-        
-        return norm_mahal
 
-    def anomaly_score(self, imgs: torch.Tensor, use_global: bool = False, global_model_name: str = 'spatial_transformer', normalize: bool = True, method: str = 'percentile', **kwargs):
+    def anomaly_score(self, imgs: torch.Tensor, use_global: bool = False, 
+                     global_model_name: str = 'clip', normalize: bool = True, 
+                     method: str = 'zscore', **kwargs):
         self.G.eval()
         self.E.eval()
         self.D.eval()
         
         with torch.no_grad():
+            # Originalni f-AnoGAN score
             z = self.E(imgs)
             z_in = z.view(z.size(0), z.size(1), 1, 1)
             recon = self.G(z_in)
@@ -656,48 +744,60 @@ class Trainer:
                 A_D = A_D + layer_diff
             
             A_D = A_D / len(feats_real)
+            patch_raw = A_R + self.cfg.kappa * A_D
+            patch_raw_np = patch_raw.cpu().numpy()
             
-            raw_score = A_R + self.cfg.kappa * A_D
-            
+            # GLOBAL SCORE ako je omogućen
             if use_global and global_model_name and global_model_name != 'none':
-                imgs_01 = (imgs + 1.0) / 2.0
-                recon_01 = (recon + 1.0) / 2.0
                 global_scores = []
-
-                for i in range(imgs_01.size(0)):
-                    feat_original = self.global_features(imgs_01[i:i+1], global_model_name)
-                    feat_recon = self.global_features(recon_01[i:i+1], global_model_name)
+                
+                for i in range(batch_size):
+                    # CLIP radi na full rezoluciji
+                    img_i = imgs[i:i+1]
+                    clip_score = self.global_anomaly_score(img_i, global_model_name)
+                    global_scores.append(clip_score)
+                
+                global_scores = np.array(global_scores)
+                
+                # KOMBINUJ I NORMALIZUJ KORISTEĆI UNIFIKOVANU NORMALIZACIJU
+                if hasattr(self, 'unified_mu') and normalize:
+                    normalized = self.normalized_combined_score(
+                        patch_raw_np, global_scores, method=method
+                    )
+                    combined_raw = (1 - self.global_model_weights.get(global_model_name, 0.5)) * patch_raw_np + \
+                                 self.global_model_weights.get(global_model_name, 0.5) * global_scores
+                else:
+                    # Fallback: jednostavna kombinacija
+                    alpha = self.global_model_weights.get(global_model_name, 0.5)
+                    combined_raw = (1 - alpha) * patch_raw_np + alpha * global_scores
                     
-                    cos_sim = F.cosine_similarity(feat_original, feat_recon, dim=1)
-                    similarity_diff = (1.0 - cos_sim) / 2.0 
-                    mahal_norm = self.normalized_mahalanobis(imgs_01[i:i+1], global_model_name)
-                    
-                    combined_score = 0.7 * similarity_diff + 0.3 * mahal_norm
-                    
-                    global_scores.append(combined_score.item())
-
-                global_scores = torch.tensor(global_scores, device=self.device)
-                weight = self.global_model_weights.get(global_model_name, 0.5)
-                raw_score = raw_score + weight * global_scores
-                    
-            raw_score_np = raw_score.cpu().numpy()
-            
-            if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:                    
-                if method == 'zscore':
-                    z_scores = (raw_score_np - self.mu_score) / (self.sigma_score + 1e-8)
-                    normalized = np.log1p(np.exp(z_scores))
-                    
-                elif method == 'minmax':
-                    normalized = (raw_score_np - self.min_score) / (self.max_score - self.min_score + 1e-8)
-                    normalized = np.clip(normalized, 0, 1)
-                    
-                elif method == 'raw':
-                    normalized = raw_score_np
+                    if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:
+                        if method == 'zscore':
+                            z_scores = (combined_raw - self.mu_score) / (self.sigma_score + 1e-8)
+                            normalized = 1 / (1 + np.exp(-z_scores))
+                        elif method == 'minmax':
+                            normalized = (combined_raw - self.min_score) / (self.max_score - self.min_score + 1e-8)
+                            normalized = np.clip(normalized, 0, 1)
+                        elif method == 'raw':
+                            normalized = combined_raw
+                    else:
+                        normalized = combined_raw
             else:
-                normalized = raw_score_np
+                # Samo patch skor
+                combined_raw = patch_raw_np
+                if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:
+                    if method == 'zscore':
+                        z_scores = (combined_raw - self.mu_score) / (self.sigma_score + 1e-8)
+                        normalized = 1 / (1 + np.exp(-z_scores))
+                    elif method == 'minmax':
+                        normalized = (combined_raw - self.min_score) / (self.max_score - self.min_score + 1e-8)
+                        normalized = np.clip(normalized, 0, 1)
+                    elif method == 'raw':
+                        normalized = combined_raw
+                else:
+                    normalized = combined_raw
         
-        return normalized, raw_score_np, recon.cpu()
-
+        return normalized, combined_raw, recon.cpu()
 
 def evaluate_single_model(trainer: Trainer, data_root: str, category: str, device: torch.device, global_model_name: str = 'none'):
     eval_dir = os.path.join(cfg.out_dir, "evaluation", category, global_model_name)
@@ -734,50 +834,37 @@ def evaluate_single_model(trainer: Trainer, data_root: str, category: str, devic
                 
                 _, _, H, W = img_tensor.shape
 
-                # 1) PATCH-BASED LOCAL FANOGAN ANOMALY SCORE
+                # KORISTITE KOMBINOVANU ANOMALY_SCORE METODU
+                # Ova metoda sada vraća već kombinovane i normalizovane skorove
+                normalized_score, raw_score, _ = trainer.anomaly_score(
+                    img_tensor, use_global=(global_model_name != 'none'), 
+                    global_model_name=global_model_name, normalize=True, method='zscore'
+                )
+                
+                image_score = float(normalized_score[0])
+                
+                # Za patch heatmap, možemo uzeti samo patch skorove
                 patch_scores = []
                 patch_locations = []
                 
-                for top in range(0, H - cfg.patch_size + 1, cfg.patch_stride):
-                    for left in range(0, W - cfg.patch_size + 1, cfg.patch_stride):
-                        patch = img_tensor[..., top:top+cfg.patch_size, left:left+cfg.patch_size]
-                        
-                        normalized_score, raw_score, _ = trainer.anomaly_score(
-                            patch, use_global=True, normalize=True, method='raw'
-                        )
-                        
-                        patch_scores.append(float(normalized_score[0]))
-                        patch_locations.append((top, left))
+                # OVO JE SAMO ZA HEATMAP VIZUALIZACIJU
+                # Za evaluaciju koristimo full-image kombinovani skor
+                if cfg.patch_stride > 0:
+                    for top in range(0, H - cfg.patch_size + 1, cfg.patch_stride):
+                        for left in range(0, W - cfg.patch_size + 1, cfg.patch_stride):
+                            patch = img_tensor[..., top:top+cfg.patch_size, left:left+cfg.patch_size]
+                            patch_norm, _, _ = trainer.anomaly_score(
+                                patch, use_global=False, normalize=True, method='zscore'
+                            )
+                            patch_scores.append(float(patch_norm[0]))
+                            patch_locations.append((top, left))
                 
-                if patch_scores:
-                    patch_score_image = np.mean(patch_scores)
-                else:
-                    patch_score_image = 0.0
-
-                # 2) GLOBAL SCORE (FULL-IMAGE)
-                if global_model_name != "none":
-                    global_score = trainer.global_anomaly_score(img_tensor, global_model_name)
-                else:
-                    global_score = 0.0
-                
-                # 3) FINAL ANOMALY SCORE (COMBINED)
-                w_patch = 0.6
-                w_global = 1.0
-                
-                image_score = w_patch * patch_score_image + w_global * global_score
-                if isinstance(patch_score_image, torch.Tensor):
-                    patch_score_image = float(patch_score_image.cpu())
-
-                if isinstance(global_score, torch.Tensor):
-                    global_score = float(global_score.cpu())
-
-                image_score = float(image_score)
                 result = {
                     'image_path': file_path,
                     'category': test_cat,
                     'image_score': image_score,
-                    'patch_scores': patch_scores,
-                    'patch_locations': patch_locations,
+                    'patch_scores': patch_scores,  # Samo za vizualizaciju
+                    'patch_locations': patch_locations,  # Samo za vizualizaciju
                     'label': 0 if test_cat == 'good' else 1
                 }
                 
@@ -877,7 +964,7 @@ def parse_args():
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--ckpt", type=str, default=None, help="GAN checkpoint path")
     parser.add_argument("--enc_ckpt", type=str, default=None, help="Encoder checkpoint path")
-    parser.add_argument("--global_model", type=str, choices=["none", "spatial_transformer"], default="none", help="Global model")
+    parser.add_argument("--global_model", type=str, choices=["none", "clip"], default="none", help="Global model")
     parser.add_argument("--max_patches", type=int, default=cfg.max_patches, help="Maximum number of patches to precompute")
     return parser.parse_args()
 
@@ -955,16 +1042,37 @@ def main():
             )
 
             trainer.compute_score_stats(train_loader)
-        
-            train_dataset_full =  MVTecLOCO_PatchDataset(
-                args.data_root, args.category, mode='train1', image_resize=cfg.image_resize
-            )
 
-            train_loader_full = DataLoader(
-                train_dataset_full, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers
+        # PRVO izračunaj UNIFIKOVANU NORMALIZACIJU
+        if not hasattr(trainer, 'unified_mu') or abs(trainer.unified_mu) < 1e-9:
+            # Koristi iste podatke za unifikovanu normalizaciju
+            train_ds_unified = MVTecLOCO_PatchDataset(
+                args.data_root, args.category, mode='train',
+                patch_size=cfg.patch_size, stride=cfg.patch_stride,
+                image_resize=cfg.image_resize, transform=base_transform,
+                precompute=cfg.patches_precompute, max_patches=min(cfg.max_patches, 5000)
             )
-    
-        trainer.compute_global_feature_stats(train_loader_full, model_name=args.global_model)
+            
+            train_loader_unified = DataLoader(
+                train_ds_unified, batch_size=cfg.batch_size, shuffle=False,
+                num_workers=cfg.num_workers
+            )
+            
+            trainer.compute_unified_normalization(train_loader_unified)
+
+        # Globalni model statistike
+        train_dataset_full = FullImageDataset(
+            args.data_root, args.category, mode="train",
+            image_resize=cfg.image_resize, transform=base_transform
+        )
+
+        train_loader_full = DataLoader(
+            train_dataset_full, batch_size=cfg.batch_size, shuffle=False,
+            num_workers=cfg.num_workers
+        )
+
+        trainer.compute_global_feature_stats(train_loader_full, model_name=args.global_model)        
+        
         auc_score, ap_score, optimal_threshold, all_results = evaluate_single_model(
             trainer, args.data_root, args.category, device, args.global_model
         )
