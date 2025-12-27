@@ -12,11 +12,11 @@ Struktura projekta
 └── README.md
 
 Instalacija zavisnosti:
-pip install torch torchvision numpy matplotlib seaborn pandas scipy tqdm pillow
+pip install torch torchvision numpy matplotlib pandas scipy tqdm pillow clip
 
 Skup podataka
 
-Koristi se MVTec LOCO AD dataset.
+Koristi se MVTec LOCO dataset.
 Struktura dataset-a mora biti sljedeća:
 
 MVTec_LOCO/
@@ -76,8 +76,7 @@ python WGAN_v2.py \
   --phase eval \
   --ckpt checkpoints/gan_latest.pth \
   --enc_ckpt checkpoints/encoder_latest.pth \
-   --global_model none
-
+  --global_model none
 
 Sa globalnim modelom:
 
@@ -87,19 +86,7 @@ python WGAN_v2.py \
   --phase eval \
   --ckpt checkpoints/gan_latest.pth \
   --enc_ckpt checkpoints/encoder_latest.pth \
-  --global_model spatial_transformer
-
-Globalni model (Spatial Transformer)
-
-Opcioni globalni model analizira cijelu sliku i uči prostorne odnose između regiona.
-Koristi:
-
-CNN ekstrakciju feature-a,
-prostornu attention mapu,
-globalni prosjek (global average pooling).
-Globalni anomalijski skor se računa kao kombinacija:
-kosinusne udaljenosti globalnih feature-a,
-razlike attention mapa između originala i rekonstrukcije.
+  --global_model clip
 
 Izlaz i evaluacija
 
