@@ -1,4 +1,4 @@
- import os
+import os
 import glob
 import argparse
 from pathlib import Path
@@ -563,14 +563,11 @@ class Trainer:
         if feats_all:
             feats_all = torch.cat(feats_all, dim=0)
             self.global_mean = feats_all.mean(dim=0)
-            
-            # Za CLIP je bolje koristiti cosine distance nego Mahalanobis
-            # Ali zadržavamo za kompatibilnost
+
             if feats_all.shape[0] > feats_all.shape[1]:
                 self.global_cov = torch.cov(feats_all.T)
                 self.global_cov_inv = torch.inverse(self.global_cov + 1e-3 * torch.eye(feats_all.shape[1]))
             else:
-                # Ako imamo malo uzoraka, koristi jednostavniji pristup
                 self.global_cov_inv = torch.eye(feats_all.shape[1])
             
             print(f"Global features ({model_name}): {feats_all.shape}")
@@ -582,24 +579,19 @@ class Trainer:
             return 0.0
         
         if model_name == 'clip':
-            # Za CLIP koristimo kombinaciju distance
-            feats = self.global_features(img_tensor, model_name)  # (1, feature_dim)
+            feats = self.global_features(img_tensor, model_name)  
             feats = feats.squeeze(0)
             
-            # 1. Cosine distance od prosjeka
             cosine_dist = 1.0 - F.cosine_similarity(
                 feats.unsqueeze(0), 
                 self.global_mean.unsqueeze(0).to(feats.device)
             ).mean()
             
-            # 2. Euclidean distance (normalizovana)
             if hasattr(self, 'global_mean'):
                 euclidean_dist = torch.norm(feats - self.global_mean.to(feats.device))
-                # Normalizuj po training std ako postoji
                 if hasattr(self, 'global_std'):
                     euclidean_dist = euclidean_dist / (self.global_std + 1e-8)
             
-            # Kombinovani score
             combined_score = 0.7 * cosine_dist + 0.3 * euclidean_dist.item()
             return combined_score
 
@@ -632,20 +624,15 @@ class Trainer:
         if model_name == 'clip':
             clip_model, clip_preprocess = clip.load("ViT-B/32", device=self.device)
             
-            # Za detekciju anomalija koristimo samo image encoder
             class CLIPWrapper(nn.Module):
                 def __init__(self, clip_model):
                     super().__init__()
                     self.clip = clip_model
-                    # Freeze sve težine
                     for param in self.clip.parameters():
                         param.requires_grad = False
                 
                 def forward(self, x):
-                    # x je već u rasponu [0, 1]
-                    # CLIP očekuje specifican preprocessing
                     x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-                    # CLIP normalizacija
                     x = (x - torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1,3,1,1).to(x.device)) / \
                         torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1,3,1,1).to(x.device)
                     features = self.clip.encode_image(x)
@@ -669,7 +656,6 @@ class Trainer:
         self.D.eval()
         
         with torch.no_grad():
-            # Originalni f-AnoGAN score
             z = self.E(imgs)
             z_in = z.view(z.size(0), z.size(1), 1, 1)
             recon = self.G(z_in)
@@ -693,11 +679,10 @@ class Trainer:
                  
             raw_score_np = raw_score.cpu().numpy()
             
-            # Normalizacija
             if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:
                 if method == 'zscore':
                     z_scores = (raw_score_np - self.mu_score) / (self.sigma_score + 1e-8)
-                    normalized = 1 / (1 + np.exp(-z_scores))  # Sigmoid normalizacija
+                    normalized = 1 / (1 + np.exp(-z_scores))  
                 elif method == 'minmax':
                     normalized = (raw_score_np - self.min_score) / (self.max_score - self.min_score + 1e-8)
                     normalized = np.clip(normalized, 0, 1)
@@ -974,7 +959,6 @@ def main():
                 train_dataset_full, batch_size=1, shuffle=False
             )
 
-        
             trainer.compute_global_feature_stats(train_loader_full, model_name=args.global_model)        
             auc_score, ap_score, optimal_threshold, all_results = evaluate_single_model(
             trainer, args.data_root, args.category, device, args.global_model
