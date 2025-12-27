@@ -12,7 +12,6 @@ from tqdm import tqdm
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 from scipy.stats import gaussian_kde, norm
 import warnings
@@ -317,15 +316,14 @@ class Trainer:
         self.opt_E = torch.optim.Adam(self.E.parameters(), lr=cfg.lr, betas=cfg.betas)
 
         self.global_model_weights = {
-            'clip': 0.6,  # Povećano za bolju detekciju logičkih anomalija
+            'clip': 0.6, 
         }
         self.mu_score = 0.0
         self.sigma_score = 1.0
         self.min_score = 0.0
         self.max_score = 1.0
         self.q95 = 0.0
-        
-        # UNIFIKOVANE NORMALIZACIJE
+     
         self.unified_mu = 0.0
         self.unified_sigma = 1.0
         self.unified_min = 0.0
@@ -334,33 +332,26 @@ class Trainer:
         self.global_models = {}
 
     def compute_unified_normalization(self, train_dataloader):
-        """Računa normalizacione parametre za KOMBINOVANI skor"""
         all_combined_scores = []
-        
-        print("Computing unified normalization statistics...")
-        
+                
         for imgs, _ in tqdm(train_dataloader, desc="Processing training images"):
             imgs = imgs.to(self.device)
             
-            # 1. Računaj PATCH skor (raw)
             patch_normalized, patch_raw, _ = self.anomaly_score(
                 imgs, use_global=False, normalize=False, method='raw'
             )
             
-            # 2. Računaj GLOBAL skor
             global_scores = []
             for i in range(imgs.size(0)):
                 clip_score = self.global_anomaly_score(imgs[i:i+1], 'clip')
                 global_scores.append(clip_score)
             global_scores = np.array(global_scores)
             
-            # 3. Kombinovani skor (pre normalizacije)
             alpha = self.global_model_weights.get('clip', 0.5)
             combined_raw = (1 - alpha) * patch_raw + alpha * global_scores
             
             all_combined_scores.extend(combined_raw)
         
-        # Sačuvaj statistike za KOMBINOVANI skor
         self.unified_mu = np.mean(all_combined_scores)
         self.unified_sigma = np.std(all_combined_scores)
         self.unified_min = np.min(all_combined_scores)
@@ -373,18 +364,14 @@ class Trainer:
         print(f"  95th percentile: {self.unified_q95:.4f}")
 
     def normalized_combined_score(self, patch_raw, global_raw, method='zscore'):
-        """Normalizuj KOMBINOVANI skor na isti način"""
         alpha = self.global_model_weights.get('clip', 0.5)
         combined_raw = (1 - alpha) * patch_raw + alpha * global_raw
         
         if method == 'zscore':
-            # Z-score normalizacija
             normalized = (combined_raw - self.unified_mu) / (self.unified_sigma + 1e-8)
-            # Mapiraj na [0, 1] sigmoidom
             normalized = 1 / (1 + np.exp(-normalized))
             
         elif method == 'minmax':
-            # Min-Max normalizacija na [0, 1]
             normalized = (combined_raw - self.unified_min) / (self.unified_max - self.unified_min + 1e-8)
             normalized = np.clip(normalized, 0, 1)
         elif method == 'raw':
@@ -637,24 +624,19 @@ class Trainer:
             return 0.0
         
         if model_name == 'clip':
-            # Za CLIP koristimo kombinaciju distance
             feats = self.global_features(img_tensor, model_name)  # (1, feature_dim)
             feats = feats.squeeze(0)
             
-            # 1. Cosine distance od prosjeka
             cosine_dist = 1.0 - F.cosine_similarity(
                 feats.unsqueeze(0), 
                 self.global_mean.unsqueeze(0).to(feats.device)
             ).mean()
             
-            # 2. Euclidean distance (normalizovana)
             if hasattr(self, 'global_mean'):
                 euclidean_dist = torch.norm(feats - self.global_mean.to(feats.device))
-                # Normalizuj po training std
                 if hasattr(self, 'global_std'):
                     euclidean_dist = euclidean_dist / (torch.mean(self.global_std) + 1e-8)
             
-            # Kombinovani score
             combined_score = 0.7 * cosine_dist + 0.3 * euclidean_dist.item()
             return combined_score
 
@@ -687,7 +669,6 @@ class Trainer:
         if model_name == 'clip':
             clip_model, clip_preprocess = clip.load("ViT-B/32", device=self.device)
             
-            # Za detekciju anomalija koristimo samo image encoder
             class CLIPWrapper(nn.Module):
                 def __init__(self, clip_model):
                     super().__init__()
@@ -697,14 +678,11 @@ class Trainer:
                         param.requires_grad = False
                 
                 def forward(self, x):
-                    # x je već u rasponu [0, 1]
-                    # CLIP očekuje specifican preprocessing
                     x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-                    # CLIP normalizacija
                     x = (x - torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1,3,1,1).to(x.device)) / \
                         torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1,3,1,1).to(x.device)
                     features = self.clip.encode_image(x)
-                    return features.float()  # Konvertuj u float32
+                    return features.float()  
             
             model = CLIPWrapper(clip_model).to(self.device)
         
@@ -724,7 +702,6 @@ class Trainer:
         self.D.eval()
         
         with torch.no_grad():
-            # Originalni f-AnoGAN score
             z = self.E(imgs)
             z_in = z.view(z.size(0), z.size(1), 1, 1)
             recon = self.G(z_in)
@@ -747,19 +724,16 @@ class Trainer:
             patch_raw = A_R + self.cfg.kappa * A_D
             patch_raw_np = patch_raw.cpu().numpy()
             
-            # GLOBAL SCORE ako je omogućen
             if use_global and global_model_name and global_model_name != 'none':
                 global_scores = []
                 
                 for i in range(batch_size):
-                    # CLIP radi na full rezoluciji
                     img_i = imgs[i:i+1]
                     clip_score = self.global_anomaly_score(img_i, global_model_name)
                     global_scores.append(clip_score)
                 
                 global_scores = np.array(global_scores)
                 
-                # KOMBINUJ I NORMALIZUJ KORISTEĆI UNIFIKOVANU NORMALIZACIJU
                 if hasattr(self, 'unified_mu') and normalize:
                     normalized = self.normalized_combined_score(
                         patch_raw_np, global_scores, method=method
@@ -767,7 +741,6 @@ class Trainer:
                     combined_raw = (1 - self.global_model_weights.get(global_model_name, 0.5)) * patch_raw_np + \
                                  self.global_model_weights.get(global_model_name, 0.5) * global_scores
                 else:
-                    # Fallback: jednostavna kombinacija
                     alpha = self.global_model_weights.get(global_model_name, 0.5)
                     combined_raw = (1 - alpha) * patch_raw_np + alpha * global_scores
                     
@@ -783,7 +756,6 @@ class Trainer:
                     else:
                         normalized = combined_raw
             else:
-                # Samo patch skor
                 combined_raw = patch_raw_np
                 if normalize and hasattr(self, 'mu_score') and self.sigma_score > 0:
                     if method == 'zscore':
@@ -834,8 +806,6 @@ def evaluate_single_model(trainer: Trainer, data_root: str, category: str, devic
                 
                 _, _, H, W = img_tensor.shape
 
-                # KORISTITE KOMBINOVANU ANOMALY_SCORE METODU
-                # Ova metoda sada vraća već kombinovane i normalizovane skorove
                 normalized_score, raw_score, _ = trainer.anomaly_score(
                     img_tensor, use_global=(global_model_name != 'none'), 
                     global_model_name=global_model_name, normalize=True, method='zscore'
@@ -843,12 +813,9 @@ def evaluate_single_model(trainer: Trainer, data_root: str, category: str, devic
                 
                 image_score = float(normalized_score[0])
                 
-                # Za patch heatmap, možemo uzeti samo patch skorove
                 patch_scores = []
                 patch_locations = []
-                
-                # OVO JE SAMO ZA HEATMAP VIZUALIZACIJU
-                # Za evaluaciju koristimo full-image kombinovani skor
+ 
                 if cfg.patch_stride > 0:
                     for top in range(0, H - cfg.patch_size + 1, cfg.patch_stride):
                         for left in range(0, W - cfg.patch_size + 1, cfg.patch_stride):
@@ -863,8 +830,8 @@ def evaluate_single_model(trainer: Trainer, data_root: str, category: str, devic
                     'image_path': file_path,
                     'category': test_cat,
                     'image_score': image_score,
-                    'patch_scores': patch_scores,  # Samo za vizualizaciju
-                    'patch_locations': patch_locations,  # Samo za vizualizaciju
+                    'patch_scores': patch_scores,  
+                    'patch_locations': patch_locations, 
                     'label': 0 if test_cat == 'good' else 1
                 }
                 
@@ -1043,9 +1010,7 @@ def main():
 
             trainer.compute_score_stats(train_loader)
 
-        # PRVO izračunaj UNIFIKOVANU NORMALIZACIJU
         if not hasattr(trainer, 'unified_mu') or abs(trainer.unified_mu) < 1e-9:
-            # Koristi iste podatke za unifikovanu normalizaciju
             train_ds_unified = MVTecLOCO_PatchDataset(
                 args.data_root, args.category, mode='train',
                 patch_size=cfg.patch_size, stride=cfg.patch_stride,
@@ -1060,7 +1025,6 @@ def main():
             
             trainer.compute_unified_normalization(train_loader_unified)
 
-        # Globalni model statistike
         train_dataset_full = FullImageDataset(
             args.data_root, args.category, mode="train",
             image_resize=cfg.image_resize, transform=base_transform
